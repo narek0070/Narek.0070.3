@@ -5,39 +5,15 @@
 #include "cJSON.h"
 #include <sqlite3.h>
 
+// Токен бота и имя вашего профиля Telegram
 #define BOT_TOKEN "8948767241:AAGJ_TW1Y8XvZB0UKRDnlEZNw6xaZtlgl_o"
 #define API_URL "https://api.telegram.org/bot" BOT_TOKEN "/"
+#define ADMIN_TG_USERNAME "Narek0070"
 
 typedef struct {
     char *memory;
     size_t size;
 } MemoryStruct;
-
-// Структура для пошагового мастера (Wizard)
-typedef struct UserState {
-    long long chat_id;
-    int step; // 0 - свободен, 1 - ждем марку, 2 - ждем модель, 3 - ждем год
-    char brand[64];
-    char model[64];
-    int year;
-    struct UserState *next;
-} UserState;
-
-UserState *users_head = NULL;
-
-UserState* get_user_state(long long chat_id) {
-    UserState *curr = users_head;
-    while (curr) {
-        if (curr->chat_id == chat_id) return curr;
-        curr = curr->next;
-    }
-    UserState *new_user = malloc(sizeof(UserState));
-    new_user->chat_id = chat_id;
-    new_user->step = 0;
-    new_user->next = users_head;
-    users_head = new_user;
-    return new_user;
-}
 
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
@@ -75,6 +51,7 @@ char* http_post(const char *method, const char *json_data) {
     return (res == CURLE_OK) ? chunk.memory : NULL;
 }
 
+// Отправка обычного сообщения
 void send_text_message(long long chat_id, const char *text) {
     cJSON *msg = cJSON_CreateObject();
     cJSON_AddNumberToObject(msg, "chat_id", chat_id);
@@ -89,95 +66,125 @@ void send_text_message(long long chat_id, const char *text) {
     cJSON_Delete(msg);
 }
 
-// Инициализация базы данных с официальными дилерами Армении
+// Меню покупки пакетов с кнопками-ссылками на @Narek0070
+void send_buy_menu(long long chat_id) {
+    cJSON *msg = cJSON_CreateObject();
+    cJSON_AddNumberToObject(msg, "chat_id", chat_id);
+    cJSON_AddStringToObject(msg, "text", 
+        "💳 *Выберите пакет поисков:*\n\n"
+        "Нажмите на кнопку нужного пакета, чтобы перейди в диалог с администратором (@Narek0070). "
+        "После перевода администратор подствердит платеж и поиски добавятся на ваш баланс.");
+    cJSON_AddStringToObject(msg, "parse_mode", "Markdown");
+
+    cJSON *reply_markup = cJSON_CreateObject();
+    cJSON *inline_keyboard = cJSON_CreateArray();
+
+    const char *labels[] = {
+        "➕ 5 поисков — 200 AMD",
+        "🔟 10 поисков — 300 AMD",
+        "2️⃣5️⃣ 25 поисков — 500 AMD",
+        "5️⃣0️⃣ 50 поисков — 900 AMD",
+        "💯 100 поисков — 1500 AMD"
+    };
+
+    const char *package_names[] = {
+        "5_searches_200AMD",
+        "10_searches_300AMD",
+        "25_searches_500AMD",
+        "50_searches_900AMD",
+        "100_searches_1500AMD"
+    };
+
+    for (int i = 0; i < 5; i++) {
+        cJSON *row = cJSON_CreateArray();
+        cJSON *button = cJSON_CreateObject();
+        cJSON_AddStringToObject(button, "text", labels[i]);
+
+        char url[512];
+        // Передает выбранный пакет и chat_id в личные сообщения администратору
+        snprintf(url, sizeof(url), 
+                 "https://t.me/%s?text=Здравствуйте!%%20Хочу%%20купить%%20пакет:%%20%s.%%20Мой%%20ID:%%20%lld", 
+                 ADMIN_TG_USERNAME, package_names[i], chat_id);
+        
+        cJSON_AddStringToObject(button, "url", url);
+
+        cJSON_AddItemToArray(row, button);
+        cJSON_AddItemToArray(inline_keyboard, row);
+    }
+
+    cJSON_AddItemToObject(reply_markup, "inline_keyboard", inline_keyboard);
+    cJSON_AddItemToObject(msg, "reply_markup", reply_markup);
+
+    char *json_out = cJSON_PrintUnformatted(msg);
+    http_post("sendMessage", json_out);
+
+    free(json_out);
+    cJSON_Delete(msg);
+}
+
+// Инициализация базы данных пользователей
 void init_database(sqlite3 **db) {
     sqlite3_open("cars_armenia.db", db);
     const char *sql = 
-        "CREATE TABLE IF NOT EXISTS offers ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-        "brand TEXT, model TEXT, year INT, dealer TEXT, price_amd INT, "
-        "warranty_years INT, insurance_amd INT, dealer_url TEXT);"
-        
-        "DELETE FROM offers;"
-        "INSERT INTO offers (brand, model, year, dealer, price_amd, warranty_years, insurance_amd, dealer_url) VALUES "
-        // Mercedes-Benz (Avantgarde Motors / Official)
-        "('Mercedes-Benz', 'S-Class', 2023, 'Mercedes-Benz Armenia (Avantgarde Motors)', 65000000, 2, 950000, 'https://www.mercedes-benz.am'),"
-        "('Mercedes-Benz', 'E-Class', 2022, 'Mercedes-Benz Armenia (Avantgarde Motors)', 35000000, 2, 550000, 'https://www.mercedes-benz.am'),"
-        // BMW
-        "('BMW', 'M5', 2023, 'BMW Armenia Official', 48000000, 3, 700000, 'https://www.bmw.am'),"
-        "('BMW', 'X5', 2023, 'BMW Armenia Official', 42000000, 3, 600000, 'https://www.bmw.am'),"
-        // Toyota
-        "('Toyota', 'RAV4', 2023, 'Toyota Yerevan Official', 18500000, 3, 270000, 'https://www.toyota.am'),"
-        "('Toyota', 'RAV4', 2022, 'Auto.am Import (Армения)', 16200000, 1, 230000, 'https://www.auto.am');";
-
+        "CREATE TABLE IF NOT EXISTS users ("
+        "chat_id INTEGER PRIMARY KEY, searches_left INT);"
+    ;
     sqlite3_exec(*db, sql, 0, 0, 0);
 }
 
-// Исправленный поиск с сортировкой по близости года (без ошибок, если год отличается)
-void send_car_report(sqlite3 *db, long long chat_id, const char *brand, const char *model, int year) {
-    char sql[512];
-    snprintf(sql, sizeof(sql), 
-             "SELECT dealer, year, price_amd, warranty_years, insurance_amd, dealer_url FROM offers "
-             "WHERE brand LIKE '%%%s%%' AND model LIKE '%%%s%%' ORDER BY ABS(year - %d) ASC;", 
-             brand, model, year);
-
+// Получить баланс поисков (при первом входе дает 10 бесплатных)
+int get_user_searches(sqlite3 *db, long long chat_id) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "SELECT searches_left FROM users WHERE chat_id = %lld;", chat_id);
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, 0) != SQLITE_OK) {
-        send_text_message(chat_id, "❌ Ошибка при поиске в базе данных.");
-        return;
-    }
+    int searches = -1;
 
-    char report[3072];
-    int offset = snprintf(report, sizeof(report), 
-                          "🇦🇲 *Анализ рынка Армении*\n"
-                          "🚗 *Запрос:* %s %s (%d г.)\n\n", brand, model, year);
-
-    int count = 0;
-    char best_dealer[128] = "";
-    long best_price = 0;
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *dealer = (const char *)sqlite3_column_text(stmt, 0);
-        int db_year = sqlite3_column_int(stmt, 1);
-        long price = sqlite3_column_int(stmt, 2);
-        int warranty = sqlite3_column_int(stmt, 3);
-        long insurance = sqlite3_column_int(stmt, 4);
-        const char *url = (const char *)sqlite3_column_text(stmt, 5);
-
-        if (count == 0) {
-            strncpy(best_dealer, dealer, sizeof(best_dealer));
-            best_price = price;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, 0) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            searches = sqlite3_column_int(stmt, 0);
         }
-
-        offset += snprintf(report + offset, sizeof(report) - offset,
-            "🏢 *Дилер / Салон:* %s\n"
-            "📅 *Год в наличии:* %d\n"
-            "💰 *Цена:* %ld AMD\n"
-            "🛡 *Гарантия:* %d лет\n"
-            "📋 *КАСКО:* ~%ld AMD/год\n"
-            "🌐 [Официальный сайт / Площадка](%s)\n"
-            "-----------------------------------\n",
-            dealer, db_year, price, warranty, insurance, url ? url : "https://www.auto.am");
-        count++;
-    }
-    sqlite3_finalize(stmt);
-
-    if (count == 0) {
-        snprintf(report, sizeof(report), 
-                 "❌ По запросу *%s %s (%d г.)* в Армении актуальных предложений у дилеров не найдено.", 
-                 brand, model, year);
-    } else {
-        snprintf(report + offset, sizeof(report) - offset,
-            "💡 *Рекомендация:* Ближайшее выгодное предложение у дилера *%s* (`%ld AMD`).", best_dealer, best_price);
+        sqlite3_finalize(stmt);
     }
 
-    send_text_message(chat_id, report);
+    if (searches == -1) {
+        snprintf(sql, sizeof(sql), "INSERT INTO users (chat_id, searches_left) VALUES (%lld, 10);", chat_id);
+        sqlite3_exec(db, sql, 0, 0, 0);
+        searches = 10;
+    }
+    return searches;
 }
 
-// Главный цикл с обработкой шагов мастера
+void decrement_search(sqlite3 *db, long long chat_id) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "UPDATE users SET searches_left = searches_left - 1 WHERE chat_id = %lld;", chat_id);
+    sqlite3_exec(db, sql, 0, 0, 0);
+}
+
+void add_searches(sqlite3 *db, long long chat_id, int count) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "UPDATE users SET searches_left = searches_left + %d WHERE chat_id = %lld;", count, chat_id);
+    sqlite3_exec(db, sql, 0, 0, 0);
+}
+
+// Генерация ссылки на List.am с готовым фильтром по введенной строке
+void generate_list_am_filter_url(const char *query, char *url_out, size_t max_len) {
+    char encoded[256];
+    int j = 0;
+    for (int i = 0; query[i] != '\0' && j < 240; i++) {
+        if (query[i] == ' ') {
+            encoded[j++] = '+';
+        } else {
+            encoded[j++] = query[i];
+        }
+    }
+    encoded[j] = '\0';
+    snprintf(url_out, max_len, "https://www.list.am/ru/q?q=%s", encoded);
+}
+
+// Главный цикл работы бота
 void run_bot(sqlite3 *db) {
     long long last_update_id = 0;
-    printf("🤖 Бот CarBuy AM запущен и ждет запросы...\n");
+    printf("🤖 Бот CarBuy AM с оплатой через @%s запущен...\n", ADMIN_TG_USERNAME);
 
     while (1) {
         char payload[128];
@@ -202,36 +209,76 @@ void run_bot(sqlite3 *db) {
 
                     if (text_obj && text_obj->valuestring) {
                         char *text = text_obj->valuestring;
-                        UserState *state = get_user_state(chat_id);
 
                         if (strcmp(text, "/start") == 0) {
-                            state->step = 1; // Шаг 1: ждем марку
-                            send_text_message(chat_id, "🚗 Добро пожаловать в *CarBuy AM*!\n\nВведите **марку** машины (например, `Mercedes-Benz`, `BMW`, `Toyota`):");
-                        } 
-                        else if (state->step == 1) {
-                            strncpy(state->brand, text, sizeof(state->brand) - 1);
-                            state->step = 2; // Шаг 2: ждем модель
-                            
-                            char prompt_buf[128];
-                            snprintf(prompt_buf, sizeof(prompt_buf), "✅ Марка: *%s*\n\nТеперь введите **модель** (например, `S-Class`, `M5`, `RAV4`):", state->brand);
-                            send_text_message(chat_id, prompt_buf);
+                            int left = get_user_searches(db, chat_id);
+                            char welcome[512];
+                            snprintf(welcome, sizeof(welcome), 
+                                     "🚗 Добро пожаловать в *CarBuy AM*!\n\n"
+                                     "🔍 Доступно бесплатных поисков: *%d*\n\n"
+                                     "Напишите марку, модель или год автомобиля (например: `BMW M5` или `Toyota RAV4 2023`), и бот мгновенно сформирует ссылку на **List.am** с примененным фильтром!", left);
+                            send_text_message(chat_id, welcome);
                         }
-                        else if (state->step == 2) {
-                            strncpy(state->model, text, sizeof(state->model) - 1);
-                            state->step = 3; // Шаг 3: ждем год
-                            
-                            char prompt_buf[128];
-                            snprintf(prompt_buf, sizeof(prompt_buf), "✅ Модель: *%s*\n\nВведите **год производства** (например, `2023`):", state->model);
-                            send_text_message(chat_id, prompt_buf);
+                        else if (strcmp(text, "/buy") == 0) {
+                            send_buy_menu(chat_id);
                         }
-                        else if (state->step == 3) {
-                            state->year = atoi(text);
-                            state->step = 0; // Сбрасываем мастер
+                        // АДМИН-КОМАНДА ОДОБРЕНИЯ: /add <chat_id> <количество>
+                        else if (strncmp(text, "/add ", 5) == 0) {
+                            long long target_chat_id;
+                            int count;
+                            if (sscanf(text + 5, "%lld %d", &target_chat_id, &count) == 2) {
+                                add_searches(db, target_chat_id, count);
+                                int new_balance = get_user_searches(db, target_chat_id);
+                                
+                                char admin_confirm[128];
+                                snprintf(admin_confirm, sizeof(admin_confirm), "✅ Платеж одобрен! Начислено %d поисков пользователю %lld.", count, target_chat_id);
+                                send_text_message(chat_id, admin_confirm);
 
-                            send_car_report(db, chat_id, state->brand, state->model, state->year);
+                                char user_notify[256];
+                                snprintf(user_notify, sizeof(user_notify), 
+                                         "🎉 Ваш платеж одобрен! Начислено +%d поисков.\n"
+                                         "Текущий баланс: *%d* поисков.", count, new_balance);
+                                send_text_message(target_chat_id, user_notify);
+                            } else {
+                                send_text_message(chat_id, "❌ Использование: `/add CHAT_ID КОЛИЧЕСТВО`");
+                            }
+                        }
+                        // АДМИН-КОМАНДА ОТКЛОНЕНИЯ: /reject <chat_id>
+                        else if (strncmp(text, "/reject ", 8) == 0) {
+                            long long target_chat_id;
+                            if (sscanf(text + 8, "%lld", &target_chat_id) == 1) {
+                                char admin_confirm[128];
+                                snprintf(admin_confirm, sizeof(admin_confirm), "🛑 Платеж пользователя %lld отклонен.", target_chat_id);
+                                send_text_message(chat_id, admin_confirm);
+
+                                send_text_message(target_chat_id, "❌ **Платеж отклонен.**");
+                            } else {
+                                send_text_message(chat_id, "❌ Использование: `/reject CHAT_ID`");
+                            }
                         }
                         else {
-                            send_text_message(chat_id, "Введите /start для нового поиска автомобиля.");
+                            // Обычный поисковый запрос от пользователя
+                            int left = get_user_searches(db, chat_id);
+                            if (left <= 0) {
+                                send_text_message(chat_id, "❌ У вас закончились бесплатные попытки поиска!\n\n💳 Отправьте /buy для покупки новых попыток.");
+                            } else {
+                                decrement_search(db, chat_id);
+                                int new_left = get_user_searches(db, chat_id);
+
+                                char filter_url[512];
+                                generate_list_am_filter_url(text, filter_url, sizeof(filter_url));
+
+                                char report[1024];
+                                snprintf(report, sizeof(report), 
+                                         "🇦🇲 *List.am — Поисковый фильтр готов*\n\n"
+                                         "🚘 *Ваш запрос:* `%s`\n\n"
+                                         "🔗 [Перейти к результатам на List.am](%s)\n\n"
+                                         "🔍 Осталось попыток: *%d*\n"
+                                         "💳 Пополнить баланс: /buy", 
+                                         text, filter_url, new_left);
+
+                                send_text_message(chat_id, report);
+                            }
                         }
                     }
                 }
