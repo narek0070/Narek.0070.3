@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 #include <curl/curl.h>
 #include "cJSON.h"
 #include <sqlite3.h>
@@ -17,7 +16,7 @@ typedef struct {
 
 typedef struct UserState {
     long long chat_id;
-    int step; // 0 - ожидание модели, 1 - ожидание максимального бюджета
+    int step;
     char current_query[128];
     struct UserState *next;
 } UserState;
@@ -178,66 +177,30 @@ void add_searches(sqlite3 *db, long long chat_id, int count) {
     sqlite3_exec(db, sql, 0, 0, 0);
 }
 
-typedef struct {
-    const char *keyword;
-    int make_id;  // ID марки на List.am
-    int model_id; // ID модели на List.am (параметр a39)
-} CarDictionary;
-
-CarDictionary car_dict[] = {
-    {"mercedes e class", 51, 1800},
-    {"мерседес e класс", 51, 1800},
-    {"лада нива", 73, 2305},
-    {"lada niva", 73, 2305},
-    {"bmw m5", 10, 500},
-    {"бмв м5", 10, 500},
-    {"toyota rav4", 68, 2000},
-};
-
-void to_lowercase(char *str) {
-    for(int i = 0; str[i]; i++){
-        str[i] = tolower((unsigned char)str[i]);
-    }
-}
-
+// Простая функция генерации ссылки (Текстовый поиск + максимальная цена)
 void generate_list_am_filter_url(const char *query, int max_price, char *url_out, size_t max_len) {
-    char query_lower[128];
-    strncpy(query_lower, query, sizeof(query_lower)-1);
-    query_lower[sizeof(query_lower)-1] = '\0';
-    to_lowercase(query_lower);
-
-    int found_make_id = -1;
-    int found_model_id = -1;
-
-    int dict_size = sizeof(car_dict) / sizeof(CarDictionary);
-    for (int i = 0; i < dict_size; i++) {
-        if (strstr(query_lower, car_dict[i].keyword) != NULL) {
-            found_make_id = car_dict[i].make_id;
-            found_model_id = car_dict[i].model_id;
-            break;
-        }
-    }
-
-    char price_params[64] = "";
-    if (max_price > 0) {
-        snprintf(price_params, sizeof(price_params), "&price2=%d", max_price);
-    }
-
     CURL *curl = curl_easy_init();
-    if (found_make_id != -1) {
-        snprintf(url_out, max_len, "https://www.list.am/ru/category/23/%d?a39=%d%s&crc=1", 
-                 found_make_id, found_model_id, price_params);
-    } else {
+    if (curl) {
         char *escaped = curl_easy_escape(curl, query, 0);
-        snprintf(url_out, max_len, "https://www.list.am/ru/category/23?q=%s%s&crc=1", escaped, price_params);
-        curl_free(escaped);
+        if (escaped) {
+            if (max_price > 0) {
+                snprintf(url_out, max_len, "https://www.list.am/ru/category/23?q=%s&price2=%d&crc=1", escaped, max_price);
+            } else {
+                snprintf(url_out, max_len, "https://www.list.am/ru/category/23?q=%s&crc=1", escaped);
+            }
+            curl_free(escaped);
+        } else {
+            snprintf(url_out, max_len, "https://www.list.am/ru/category/23");
+        }
+        curl_easy_cleanup(curl);
+    } else {
+        snprintf(url_out, max_len, "https://www.list.am/ru/category/23");
     }
-    curl_easy_cleanup(curl);
 }
 
 void run_bot(sqlite3 *db) {
     long long last_update_id = 0;
-    printf("🤖 Бот CarBuy AM запущен!\n");
+    printf("🤖 Бот CarBuy AM запущен! Включен текстовый поиск и фильтр бюджета (только ДО).\n");
 
     while (1) {
         char payload[128];
