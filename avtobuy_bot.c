@@ -1,11 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <curl/curl.h>
 #include "cJSON.h"
 #include <sqlite3.h>
 
-// Токен бота и имя вашего профиля Telegram
 #define BOT_TOKEN "8948767241:AAGJ_TW1Y8XvZB0UKRDnlEZNw6xaZtlgl_o"
 #define API_URL "https://api.telegram.org/bot" BOT_TOKEN "/"
 #define ADMIN_TG_USERNAME "Narek0070"
@@ -14,6 +14,30 @@ typedef struct {
     char *memory;
     size_t size;
 } MemoryStruct;
+
+typedef struct UserState {
+    long long chat_id;
+    int step; // 0 - ожидание модели, 1 - ожидание максимального бюджета
+    char current_query[128];
+    struct UserState *next;
+} UserState;
+
+UserState *users_head = NULL;
+
+UserState* get_user_state(long long chat_id) {
+    UserState *curr = users_head;
+    while (curr) {
+        if (curr->chat_id == chat_id) return curr;
+        curr = curr->next;
+    }
+    UserState *new_user = malloc(sizeof(UserState));
+    new_user->chat_id = chat_id;
+    new_user->step = 0;
+    new_user->current_query[0] = '\0';
+    new_user->next = users_head;
+    users_head = new_user;
+    return new_user;
+}
 
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
@@ -51,7 +75,6 @@ char* http_post(const char *method, const char *json_data) {
     return (res == CURLE_OK) ? chunk.memory : NULL;
 }
 
-// Отправка обычного сообщения
 void send_text_message(long long chat_id, const char *text) {
     cJSON *msg = cJSON_CreateObject();
     cJSON_AddNumberToObject(msg, "chat_id", chat_id);
@@ -66,14 +89,13 @@ void send_text_message(long long chat_id, const char *text) {
     cJSON_Delete(msg);
 }
 
-// Меню покупки пакетов с кнопками-ссылками на @Narek0070
 void send_buy_menu(long long chat_id) {
     cJSON *msg = cJSON_CreateObject();
     cJSON_AddNumberToObject(msg, "chat_id", chat_id);
     cJSON_AddStringToObject(msg, "text", 
         "💳 *Выберите пакет поисков:*\n\n"
-        "Нажмите на кнопку нужного пакета, чтобы перейди в диалог с администратором (@Narek0070). "
-        "После перевода администратор подствердит платеж и поиски добавятся на ваш баланс.");
+        "Нажмите на кнопку нужного пакета, чтобы перейти в диалог с администратором (@Narek0070). "
+        "После перевода администратор подтвердит платеж и поиски добавятся на ваш баланс.");
     cJSON_AddStringToObject(msg, "parse_mode", "Markdown");
 
     cJSON *reply_markup = cJSON_CreateObject();
@@ -101,7 +123,6 @@ void send_buy_menu(long long chat_id) {
         cJSON_AddStringToObject(button, "text", labels[i]);
 
         char url[512];
-        // Передает выбранный пакет и chat_id в личные сообщения администратору
         snprintf(url, sizeof(url), 
                  "https://t.me/%s?text=Здравствуйте!%%20Хочу%%20купить%%20пакет:%%20%s.%%20Мой%%20ID:%%20%lld", 
                  ADMIN_TG_USERNAME, package_names[i], chat_id);
@@ -122,17 +143,11 @@ void send_buy_menu(long long chat_id) {
     cJSON_Delete(msg);
 }
 
-// Инициализация базы данных пользователей
 void init_database(sqlite3 **db) {
     sqlite3_open("cars_armenia.db", db);
-    const char *sql = 
-        "CREATE TABLE IF NOT EXISTS users ("
-        "chat_id INTEGER PRIMARY KEY, searches_left INT);"
-    ;
-    sqlite3_exec(*db, sql, 0, 0, 0);
+    sqlite3_exec(*db, "CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, searches_left INT);", 0, 0, 0);
 }
 
-// Получить баланс поисков (при первом входе дает 10 бесплатных)
 int get_user_searches(sqlite3 *db, long long chat_id) {
     char sql[128];
     snprintf(sql, sizeof(sql), "SELECT searches_left FROM users WHERE chat_id = %lld;", chat_id);
@@ -140,12 +155,9 @@ int get_user_searches(sqlite3 *db, long long chat_id) {
     int searches = -1;
 
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, 0) == SQLITE_OK) {
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            searches = sqlite3_column_int(stmt, 0);
-        }
+        if (sqlite3_step(stmt) == SQLITE_ROW) searches = sqlite3_column_int(stmt, 0);
         sqlite3_finalize(stmt);
     }
-
     if (searches == -1) {
         snprintf(sql, sizeof(sql), "INSERT INTO users (chat_id, searches_left) VALUES (%lld, 10);", chat_id);
         sqlite3_exec(db, sql, 0, 0, 0);
@@ -166,25 +178,66 @@ void add_searches(sqlite3 *db, long long chat_id, int count) {
     sqlite3_exec(db, sql, 0, 0, 0);
 }
 
-// Генерация ссылки на List.am с готовым фильтром по введенной строке
-void generate_list_am_filter_url(const char *query, char *url_out, size_t max_len) {
-    char encoded[256];
-    int j = 0;
-    for (int i = 0; query[i] != '\0' && j < 240; i++) {
-        if (query[i] == ' ') {
-            encoded[j++] = '+';
-        } else {
-            encoded[j++] = query[i];
-        }
+typedef struct {
+    const char *keyword;
+    int make_id;  // ID марки на List.am
+    int model_id; // ID модели на List.am (параметр a39)
+} CarDictionary;
+
+CarDictionary car_dict[] = {
+    {"mercedes e class", 51, 1800},
+    {"мерседес e класс", 51, 1800},
+    {"лада нива", 73, 2305},
+    {"lada niva", 73, 2305},
+    {"bmw m5", 10, 500},
+    {"бмв м5", 10, 500},
+    {"toyota rav4", 68, 2000},
+};
+
+void to_lowercase(char *str) {
+    for(int i = 0; str[i]; i++){
+        str[i] = tolower((unsigned char)str[i]);
     }
-    encoded[j] = '\0';
-    snprintf(url_out, max_len, "https://www.list.am/ru/q?q=%s", encoded);
 }
 
-// Главный цикл работы бота
+void generate_list_am_filter_url(const char *query, int max_price, char *url_out, size_t max_len) {
+    char query_lower[128];
+    strncpy(query_lower, query, sizeof(query_lower)-1);
+    query_lower[sizeof(query_lower)-1] = '\0';
+    to_lowercase(query_lower);
+
+    int found_make_id = -1;
+    int found_model_id = -1;
+
+    int dict_size = sizeof(car_dict) / sizeof(CarDictionary);
+    for (int i = 0; i < dict_size; i++) {
+        if (strstr(query_lower, car_dict[i].keyword) != NULL) {
+            found_make_id = car_dict[i].make_id;
+            found_model_id = car_dict[i].model_id;
+            break;
+        }
+    }
+
+    char price_params[64] = "";
+    if (max_price > 0) {
+        snprintf(price_params, sizeof(price_params), "&price2=%d", max_price);
+    }
+
+    CURL *curl = curl_easy_init();
+    if (found_make_id != -1) {
+        snprintf(url_out, max_len, "https://www.list.am/ru/category/23/%d?a39=%d%s&crc=1", 
+                 found_make_id, found_model_id, price_params);
+    } else {
+        char *escaped = curl_easy_escape(curl, query, 0);
+        snprintf(url_out, max_len, "https://www.list.am/ru/category/23?q=%s%s&crc=1", escaped, price_params);
+        curl_free(escaped);
+    }
+    curl_easy_cleanup(curl);
+}
+
 void run_bot(sqlite3 *db) {
     long long last_update_id = 0;
-    printf("🤖 Бот CarBuy AM с оплатой через @%s запущен...\n", ADMIN_TG_USERNAME);
+    printf("🤖 Бот CarBuy AM запущен!\n");
 
     while (1) {
         char payload[128];
@@ -209,75 +262,84 @@ void run_bot(sqlite3 *db) {
 
                     if (text_obj && text_obj->valuestring) {
                         char *text = text_obj->valuestring;
+                        UserState *state = get_user_state(chat_id);
 
                         if (strcmp(text, "/start") == 0) {
+                            state->step = 0; 
                             int left = get_user_searches(db, chat_id);
                             char welcome[512];
                             snprintf(welcome, sizeof(welcome), 
                                      "🚗 Добро пожаловать в *CarBuy AM*!\n\n"
                                      "🔍 Доступно бесплатных поисков: *%d*\n\n"
-                                     "Напишите марку, модель или год автомобиля (например: `BMW M5` или `Toyota RAV4 2023`), и бот мгновенно сформирует ссылку на **List.am** с примененным фильтром!", left);
+                                     "Напишите марку или модель (например: `BMW M5`, `Mercedes E class` или `Лада Нива`).", left);
                             send_text_message(chat_id, welcome);
                         }
                         else if (strcmp(text, "/buy") == 0) {
                             send_buy_menu(chat_id);
                         }
-                        // АДМИН-КОМАНДА ОДОБРЕНИЯ: /add <chat_id> <количество>
                         else if (strncmp(text, "/add ", 5) == 0) {
                             long long target_chat_id;
                             int count;
                             if (sscanf(text + 5, "%lld %d", &target_chat_id, &count) == 2) {
                                 add_searches(db, target_chat_id, count);
-                                int new_balance = get_user_searches(db, target_chat_id);
-                                
                                 char admin_confirm[128];
-                                snprintf(admin_confirm, sizeof(admin_confirm), "✅ Платеж одобрен! Начислено %d поисков пользователю %lld.", count, target_chat_id);
+                                snprintf(admin_confirm, sizeof(admin_confirm), "✅ Начислено %d поисков пользователю %lld.", count, target_chat_id);
                                 send_text_message(chat_id, admin_confirm);
-
                                 char user_notify[256];
-                                snprintf(user_notify, sizeof(user_notify), 
-                                         "🎉 Ваш платеж одобрен! Начислено +%d поисков.\n"
-                                         "Текущий баланс: *%d* поисков.", count, new_balance);
+                                snprintf(user_notify, sizeof(user_notify), "🎉 Ваш платеж одобрен! Начислено +%d поисков.", count);
                                 send_text_message(target_chat_id, user_notify);
-                            } else {
-                                send_text_message(chat_id, "❌ Использование: `/add CHAT_ID КОЛИЧЕСТВО`");
                             }
                         }
-                        // АДМИН-КОМАНДА ОТКЛОНЕНИЯ: /reject <chat_id>
                         else if (strncmp(text, "/reject ", 8) == 0) {
                             long long target_chat_id;
                             if (sscanf(text + 8, "%lld", &target_chat_id) == 1) {
-                                char admin_confirm[128];
-                                snprintf(admin_confirm, sizeof(admin_confirm), "🛑 Платеж пользователя %lld отклонен.", target_chat_id);
-                                send_text_message(chat_id, admin_confirm);
-
+                                send_text_message(chat_id, "🛑 Платеж отклонен.");
                                 send_text_message(target_chat_id, "❌ **Платеж отклонен.**");
-                            } else {
-                                send_text_message(chat_id, "❌ Использование: `/reject CHAT_ID`");
                             }
                         }
                         else {
-                            // Обычный поисковый запрос от пользователя
-                            int left = get_user_searches(db, chat_id);
-                            if (left <= 0) {
-                                send_text_message(chat_id, "❌ У вас закончились бесплатные попытки поиска!\n\n💳 Отправьте /buy для покупки новых попыток.");
-                            } else {
+                            if (state->step == 0) {
+                                int left = get_user_searches(db, chat_id);
+                                if (left <= 0) {
+                                    send_text_message(chat_id, "❌ У вас закончились бесплатные попытки!\n\n💳 Нажмите /buy для пополнения.");
+                                } else {
+                                    strncpy(state->current_query, text, sizeof(state->current_query) - 1);
+                                    state->step = 1; 
+
+                                    char prompt[512];
+                                    snprintf(prompt, sizeof(prompt), 
+                                             "✅ Вы ищете: *%s*\n\n"
+                                             "💵 *Укажите ваш максимальный бюджет (в $):*\n"
+                                             "Введите сумму (ДО), например: `15000`\n"
+                                             "Отправьте `0`, если цена не важна.", state->current_query);
+                                    send_text_message(chat_id, prompt);
+                                }
+                            } 
+                            else if (state->step == 1) {
+                                int max_price = 0;
+                                sscanf(text, "%d", &max_price);
+
                                 decrement_search(db, chat_id);
                                 int new_left = get_user_searches(db, chat_id);
 
-                                char filter_url[512];
-                                generate_list_am_filter_url(text, filter_url, sizeof(filter_url));
+                                char filter_url[1024];
+                                generate_list_am_filter_url(state->current_query, max_price, filter_url, sizeof(filter_url));
+
+                                char price_text[128] = "Любая";
+                                if (max_price > 0) snprintf(price_text, sizeof(price_text), "до %d$", max_price);
 
                                 char report[1024];
                                 snprintf(report, sizeof(report), 
                                          "🇦🇲 *List.am — Поисковый фильтр готов*\n\n"
-                                         "🚘 *Ваш запрос:* `%s`\n\n"
-                                         "🔗 [Перейти к результатам на List.am](%s)\n\n"
+                                         "🚘 *Модель:* `%s`\n"
+                                         "💵 *Бюджет:* `%s`\n\n"
+                                         "🔗 [Нажмите сюда, чтобы открыть сайт с готовым фильтром](%s)\n\n"
                                          "🔍 Осталось попыток: *%d*\n"
                                          "💳 Пополнить баланс: /buy", 
-                                         text, filter_url, new_left);
+                                         state->current_query, price_text, filter_url, new_left);
 
                                 send_text_message(chat_id, report);
+                                state->step = 0; 
                             }
                         }
                     }
@@ -291,12 +353,9 @@ void run_bot(sqlite3 *db) {
 
 int main(void) {
     curl_global_init(CURL_GLOBAL_ALL);
-    
     sqlite3 *db;
     init_database(&db);
-
     run_bot(db);
-
     sqlite3_close(db);
     curl_global_cleanup();
     return 0;
